@@ -1,0 +1,15 @@
+services:
+  teleport:
+    build:
+      context: .
+      dockerfile: Server/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - TELEPORT_StorePath=/data
+    volumes:
+      - teleport-data:/data
+    restart: unless-stopped
+
+volumes:
+  teleport-data:
