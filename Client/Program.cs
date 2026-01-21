@@ -335,7 +335,7 @@ namespace Teleport.Client
                     var slotNameBytes = System.Text.Encoding.UTF8.GetBytes(slotName);
                     var encryptedSlotName = Crypto.Encrypt(slotNameBytes, _key);
 
-                    var lengthBytes = BitConverter.GetBytes(encryptedSlotName.Length); // OK если обе стороны одинаково трактуют endian
+                    var lengthBytes = BitConverter.GetBytes(encryptedSlotName.Length); 
                     await writer.WriteAsync(lengthBytes, 0, 4);
                     await writer.WriteAsync(encryptedSlotName, 0, encryptedSlotName.Length);
                     await writer.FlushAsync();
@@ -474,14 +474,68 @@ namespace Teleport.Client
 
             try
             {
-                // Send download request with encrypted slot name
-                var slotNameBytes = System.Text.Encoding.UTF8.GetBytes(slotName);
-                var encryptedSlotName = Crypto.Encrypt(slotNameBytes, _key);
+                var pipe = new Pipe();
 
-                using var content = new ByteArrayContent(encryptedSlotName);
-                content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+                using var request = new HttpRequestMessage(HttpMethod.Post, "v2/download-stream")
+                {
+                    Content = new StreamContent(pipe.Reader.AsStream())
+                };
+                request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
 
-                using var response = await _httpClient.PostAsync("v2/download-stream", content);
+                var downloadTask = _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+                Exception? writeError = null;
+
+                try
+                {
+                    await using var writer = pipe.Writer.AsStream(leaveOpen: true);
+
+                    // Send encrypted slot name with length prefix
+                    var slotNameBytes = System.Text.Encoding.UTF8.GetBytes(slotName);
+                    var encryptedSlotName = Crypto.Encrypt(slotNameBytes, _key);
+
+                    var lengthBytes = BitConverter.GetBytes(encryptedSlotName.Length);
+                    await writer.WriteAsync(lengthBytes, 0, 4);
+                    await writer.WriteAsync(encryptedSlotName, 0, encryptedSlotName.Length);
+
+                    // Send single file name if specified
+                    if (!string.IsNullOrWhiteSpace(singleFile))
+                    {
+                        var fileNameBytes = System.Text.Encoding.UTF8.GetBytes(singleFile);
+                        var encryptedFileName = Crypto.Encrypt(fileNameBytes, _key);
+
+                        var fileNameLengthBytes = BitConverter.GetBytes(encryptedFileName.Length);
+                        await writer.WriteAsync(fileNameLengthBytes, 0, 4);
+                        await writer.WriteAsync(encryptedFileName, 0, encryptedFileName.Length);
+                    }
+                    else
+                    {
+                        // Send 0 length to indicate no single file
+                        var zeroBytes = BitConverter.GetBytes(0);
+                        await writer.WriteAsync(zeroBytes, 0, 4);
+                    }
+
+                    await writer.FlushAsync();
+                }
+                catch (Exception ex)
+                {
+                    writeError = ex;
+                }
+                finally
+                {
+                    if (writeError is null)
+                        await pipe.Writer.CompleteAsync();
+                    else
+                        await pipe.Writer.CompleteAsync(writeError);
+                }
+
+                // Now wait for response
+                var response = await downloadTask;
+
+                if (writeError is not null)
+                {
+                    throw writeError;
+                }
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -496,7 +550,6 @@ namespace Teleport.Client
                 await using var gzipStream = new GZipStream(decryptStream, CompressionMode.Decompress);
                 await using var tarReader = new TarReader(gzipStream, leaveOpen: false);
 
-                int filesProcessed = 0;
                 TarEntry tarEntry;
 
                 while ((tarEntry = await tarReader.GetNextEntryAsync()) != null)
@@ -546,7 +599,6 @@ namespace Teleport.Client
                         }
 
                         progress.CompleteFile();
-                        filesProcessed++;
                     }
                 }
 

@@ -181,23 +181,24 @@ namespace Teleport.Server.Controllers
 
             try
             {
-                // Read and decrypt the request to get slot name
-                using var ms = new MemoryStream();
-                await Request.Body.CopyToAsync(ms);
-                var encrypted = ms.ToArray();
+                var lengthBuffer = new byte[4];
+                await Request.Body.ReadAsync(lengthBuffer, 0, 4);
+                var slotNameLength = BitConverter.ToInt32(lengthBuffer, 0);
 
-                byte[] decrypted;
+                var encryptedSlotName = new byte[slotNameLength];
+                await Request.Body.ReadAsync(encryptedSlotName, 0, slotNameLength);
+
+                byte[] decryptedSlotName;
                 try
                 {
-                    decrypted = Crypto.Decrypt(encrypted, _key);
+                    decryptedSlotName = Crypto.Decrypt(encryptedSlotName, _key);
                 }
                 catch
                 {
                     return BadRequest("Decryption failed");
                 }
 
-                // Extract slot name (simple string)
-                var slotName = System.Text.Encoding.UTF8.GetString(decrypted);
+                var slotName = System.Text.Encoding.UTF8.GetString(decryptedSlotName);
 
                 if (string.IsNullOrWhiteSpace(slotName))
                 {
@@ -211,6 +212,29 @@ namespace Teleport.Server.Controllers
                     return NotFound("Slot not found");
                 }
 
+                var singleFileLengthBuffer = new byte[4];
+                await Request.Body.ReadAsync(singleFileLengthBuffer, 0, 4);
+                var singleFileNameLength = BitConverter.ToInt32(singleFileLengthBuffer, 0);
+
+                byte[] singleFileNameBytes;
+                string singleFileName = null;
+
+                if (singleFileNameLength > 0)
+                {
+                    singleFileNameBytes = new byte[singleFileNameLength];
+                    await Request.Body.ReadAsync(singleFileNameBytes, 0, singleFileNameLength);
+
+                    try
+                    {
+                        singleFileName = System.Text.Encoding.UTF8.GetString(Crypto.Decrypt(singleFileNameBytes, _key));
+                    }
+                    catch
+                    {
+                        return BadRequest("Decryption failed");
+                    }
+                }
+
+
                 // Create encrypted stream pipeline: TAR -> GZIP -> Encrypt -> Response
                 Response.ContentType = "application/octet-stream";
                 Response.Headers["X-Content-Type"] = "application/gzip";
@@ -222,8 +246,24 @@ namespace Teleport.Server.Controllers
 
                 try
                 {
-                    // Add all files from slot to TAR archive
-                    await AddFilesToTarAsync(slotPath, slotPath, tarWriter);
+                    if (string.IsNullOrWhiteSpace(singleFileName))
+                    {
+                        // Add all files from slot to TAR archive
+                        await AddFilesToTarAsync(slotPath, slotPath, tarWriter);
+                    }
+                    else
+                    {
+                        // Build full path for single file
+                        var normalizedFileName = singleFileName.Replace('/', Path.DirectorySeparatorChar);
+                        var fullFilePath = Path.Combine(slotPath, normalizedFileName);
+
+                        if (!System.IO.File.Exists(fullFilePath))
+                        {
+                            return NotFound($"File not found: {singleFileName}");
+                        }
+
+                        await AddFileToTarAsync(slotPath, fullFilePath, tarWriter);
+                    }
 
                     return new EmptyResult();
                 }
@@ -252,7 +292,7 @@ namespace Teleport.Server.Controllers
             }
 
             try
-            {   
+            {
                 // First 4 bytes: encrypted slot name length
                 // Next N bytes: encrypted slot name
                 // Rest: encrypted TAR.GZ stream
@@ -339,23 +379,29 @@ namespace Teleport.Server.Controllers
         {
             foreach (var file in Directory.GetFiles(currentPath))
             {
-                var relativePath = file.Substring(slotPath.Length + 1).Replace(Path.DirectorySeparatorChar, '/');
-
-                var tarEntry = new PaxTarEntry(TarEntryType.RegularFile, relativePath)
-                {
-                    ModificationTime = System.IO.File.GetLastWriteTime(file)
-                };
-
-                await using var fileStream = System.IO.File.OpenRead(file);
-                tarEntry.DataStream = fileStream;
-
-                await tarWriter.WriteEntryAsync(tarEntry);
+                await AddFileToTarAsync(slotPath, file, tarWriter);
             }
 
             foreach (var directory in Directory.GetDirectories(currentPath))
             {
                 await AddFilesToTarAsync(slotPath, directory, tarWriter);
             }
+        }
+
+        private async Task AddFileToTarAsync(string slotPath, string file, TarWriter tarWriter)
+        {
+            var relativePath = file.Substring(slotPath.Length + 1).Replace(Path.DirectorySeparatorChar, '/');
+
+            var tarEntry = new PaxTarEntry(TarEntryType.RegularFile, relativePath)
+            {
+                ModificationTime = System.IO.File.GetLastWriteTime(file)
+            };
+
+            await using var fileStream = System.IO.File.OpenRead(file);
+            tarEntry.DataStream = fileStream;
+
+            await tarWriter.WriteEntryAsync(tarEntry);
+
         }
     }
 }
