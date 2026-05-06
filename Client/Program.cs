@@ -590,11 +590,10 @@ namespace Teleport.Client
 
                         progress.StartFile(entryPath, entrySize);
 
+                        await using var fileStream = File.Create(localPath);
                         if (tarEntry.DataStream != null)
                         {
                             await using var progressStream = new ProgressStream(tarEntry.DataStream, progress);
-                            await using var fileStream = File.Create(localPath);
-
                             await progressStream.CopyToAsync(fileStream);
                         }
 

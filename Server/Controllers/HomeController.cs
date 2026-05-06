@@ -351,9 +351,9 @@ namespace Teleport.Server.Controllers
                                 Directory.CreateDirectory(directory);
                             }
 
+                            await using var fileStream = System.IO.File.Create(fullPath);
                             if (tarEntry.DataStream != null)
                             {
-                                await using var fileStream = System.IO.File.Create(fullPath);
                                 await tarEntry.DataStream.CopyToAsync(fileStream);
                             }
                         }
